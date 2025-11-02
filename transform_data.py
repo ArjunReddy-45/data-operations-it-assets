@@ -1,222 +1,241 @@
-from elasticsearch import Elasticsearch
-from datetime import datetime, date
+import pandas as pd
+from elasticsearch import Elasticsearch, helpers
+import logging
+from datetime import datetime, timedelta
 import json
 
-# Configuration
-ES_ENDPOINT = "https://my-elasticsearch-project-e74838.es.asia-south1.gcp.elastic.cloud:443"
-ES_API_KEY = "NXFiZUxwb0JOOUVTMksyeElqa0U6S051T2V2NnFJSlBaNW5ZOFZWaU5odw=="
-SOURCE_INDEX = "it_assets_index"
-TARGET_INDEX = "it_assets_enriched"
-
-# === CONNECT TO ELASTICSEARCH ===
-es = Elasticsearch(
-    ES_ENDPOINT,
-    api_key=ES_API_KEY,
-    verify_certs=False  # Temporary fix for SSL issues
+# Configure comprehensive logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('transformation.log'),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-# === CHECK CONNECTION ===
-if not es.ping():
-    print("❌ Connection failed! Please check endpoint or API key.")
-    exit()
-else:
-    print("✅ Connected to Elasticsearch!")
-
-# === CREATE ENRICHED INDEX MAPPING ===
-enriched_mapping = {
-    "mappings": {
-        "properties": {
-            "hostname": {"type": "keyword"},
-            "country": {"type": "keyword"},
-            "operating_system_name": {"type": "keyword"},
-            "operating_system_provider": {"type": "keyword"},
-            "operating_system_installation_date": {
-                "type": "date",
-                "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis"
-            },
-            "operating_system_lifecycle_status": {"type": "keyword"},
-            "os_is_virtual": {"type": "keyword"},
-            "is_internet_facing": {"type": "keyword"},
-            "image_purpose": {"type": "keyword"},
-            "os_system_id": {"type": "keyword"},
-            "performance_score": {"type": "float"},
-            "indexed_at": {"type": "date"},
-            "record_id": {"type": "integer"},
-            # New enriched fields
-            "risk_level": {"type": "keyword"},
-            "system_age_years": {"type": "integer"},
-            "age_category": {"type": "keyword"},
-            "compliance_status": {"type": "keyword"},
-            "enriched_at": {"type": "date"}
-        }
-    }
-}
-
-# === DELETE AND CREATE TARGET INDEX ===
-try:
-    if es.indices.exists(index=TARGET_INDEX):
-        es.indices.delete(index=TARGET_INDEX)
-        print(f"🗑️ Deleted existing index '{TARGET_INDEX}'")
+class ITAssetTransformer:
+    """
+    Advanced IT asset data transformation and risk assessment engine.
+    """
     
-    es.indices.create(index=TARGET_INDEX, body=enriched_mapping)
-    print(f"✅ Created enriched index '{TARGET_INDEX}'")
-except Exception as e:
-    print(f"❌ Error creating index: {e}")
-    exit()
-
-# === REINDEX WITH TRANSFORMATIONS ===
-reindex_body = {
-    "source": {
-        "index": SOURCE_INDEX
-    },
-    "dest": {
-        "index": TARGET_INDEX
-    },
-    "script": {
-        "source": """
-            // Calculate risk level based on lifecycle status
-            if (ctx._source.operating_system_lifecycle_status != null) {
-                String status = ctx._source.operating_system_lifecycle_status.toLowerCase();
-                if (status.contains('eol') || status.contains('eos') || status.contains('end')) {
-                    ctx._source.risk_level = 'High';
-                } else if (status.contains('deprecated') || status.contains('unsupported')) {
-                    ctx._source.risk_level = 'Medium';
-                } else {
-                    ctx._source.risk_level = 'Low';
-                }
-            } else {
-                ctx._source.risk_level = 'Unknown';
-            }
-            
-            // Calculate system age in years (simplified)
-            if (ctx._source.operating_system_installation_date != null) {
-                try {
-                    String dateStr = ctx._source.operating_system_installation_date;
-                    // Simple age calculation - assume current year 2025
-                    if (dateStr.length() >= 4) {
-                        int installYear = Integer.parseInt(dateStr.substring(0, 4));
-                        int currentYear = 2025;
-                        ctx._source.system_age_years = currentYear - installYear;
-                        
-                        // Categorize by age
-                        int age = ctx._source.system_age_years;
-                        if (age < 2) {
-                            ctx._source.age_category = 'New';
-                        } else if (age < 5) {
-                            ctx._source.age_category = 'Mature';
-                        } else {
-                            ctx._source.age_category = 'Legacy';
-                        }
-                    } else {
-                        ctx._source.system_age_years = 0;
-                        ctx._source.age_category = 'Unknown';
-                    }
-                } catch (Exception e) {
-                    ctx._source.system_age_years = 0;
-                    ctx._source.age_category = 'Unknown';
-                }
-            } else {
-                ctx._source.system_age_years = 0;
-                ctx._source.age_category = 'Unknown';
-            }
-            
-            // Determine compliance status
-            if (ctx._source.risk_level == 'High' || ctx._source.age_category == 'Legacy') {
-                ctx._source.compliance_status = 'Non-Compliant';
-            } else if (ctx._source.risk_level == 'Medium') {
-                ctx._source.compliance_status = 'At-Risk';
-            } else {
-                ctx._source.compliance_status = 'Compliant';
-            }
-            
-            // Add enrichment timestamp
-            ctx._source.enriched_at = '2025-11-02T00:00:00Z';
-            
-            // Skip records with missing hostnames or Unknown providers
-            if (ctx._source.hostname == null || ctx._source.hostname == '' || 
-                ctx._source.operating_system_provider == 'Unknown') {
-                ctx.op = 'noop';
-            }
-        """,
-        "lang": "painless"
-    }
-}
-
-print("🔄 Starting reindexing with transformations...")
-
-try:
-    response = es.reindex(body=reindex_body, wait_for_completion=True, request_timeout=300)
-    
-    print(f"✅ Reindexing completed!")
-    print(f"   - Total processed: {response.get('total', 0)}")
-    print(f"   - Created: {response.get('created', 0)}")
-    print(f"   - Updated: {response.get('updated', 0)}")
-    print(f"   - Deleted: {response.get('deleted', 0)}")
-    print(f"   - Time taken: {response.get('took', 0)}ms")
-    
-    if response.get('failures'):
-        print(f"⚠️ Some failures occurred:")
-        for failure in response['failures'][:3]:
-            print(f"   - {failure}")
-    
-except Exception as e:
-    print(f"❌ Reindexing failed: {e}")
-
-# === VERIFY ENRICHED DATA ===
-try:
-    # Get document count
-    doc_count = es.count(index=TARGET_INDEX)['count']
-    print(f"🔍 Enriched index contains {doc_count} documents")
-    
-    # Sample a few documents to verify transformations
-    sample_docs = es.search(
-        index=TARGET_INDEX,
-        body={
-            "size": 3,
-            "_source": ["hostname", "risk_level", "system_age_years", "age_category", "compliance_status"]
-        }
-    )
-    
-    print("\n📋 Sample enriched documents:")
-    for doc in sample_docs['hits']['hits']:
-        source = doc['_source']
-        print(f"   • {source.get('hostname', 'N/A')} - Risk: {source.get('risk_level', 'N/A')}, "
-              f"Age: {source.get('system_age_years', 'N/A')} years ({source.get('age_category', 'N/A')}), "
-              f"Compliance: {source.get('compliance_status', 'N/A')}")
-    
-    # Get aggregation stats
-    agg_response = es.search(
-        index=TARGET_INDEX,
-        body={
-            "size": 0,
-            "aggs": {
-                "risk_levels": {
-                    "terms": {"field": "risk_level"}
-                },
-                "compliance_status": {
-                    "terms": {"field": "compliance_status"}
-                },
-                "age_categories": {
-                    "terms": {"field": "age_category"}
-                }
-            }
-        }
-    )
-    
-    print("\n📊 Data Summary:")
-    print("Risk Levels:")
-    for bucket in agg_response['aggregations']['risk_levels']['buckets']:
-        print(f"   • {bucket['key']}: {bucket['doc_count']} assets")
-    
-    print("Compliance Status:")
-    for bucket in agg_response['aggregations']['compliance_status']['buckets']:
-        print(f"   • {bucket['key']}: {bucket['doc_count']} assets")
-    
-    print("Age Categories:")
-    for bucket in agg_response['aggregations']['age_categories']['buckets']:
-        print(f"   • {bucket['key']}: {bucket['doc_count']} assets")
+    def __init__(self, cloud_id, api_key):
+        """
+        Initialize Elasticsearch connection for data transformation.
         
-except Exception as e:
-    print(f"⚠️ Error verifying data: {e}")
+        Args:
+            cloud_id (str): Elasticsearch Cloud cluster ID
+            api_key (str): API key for authentication
+        """
+        self.es = Elasticsearch(
+            cloud_id=cloud_id,
+            api_key=api_key,
+            request_timeout=60,
+            max_retries=3,
+            retry_on_timeout=True
+        )
+        self.source_index = "it_assets_index"
+        self.target_index = "it_assets_enhanced"
+        
+        # Risk assessment configuration
+        self.eol_eos_dates = {
+            "Windows Server 2012": "2023-10-10",
+            "Windows Server 2016": "2027-01-12",
+            "Ubuntu 18.04": "2023-05-31",
+            "CentOS 7": "2024-06-30",
+            "Windows 10": "2025-10-14"
+        }
+        
+        self.high_risk_countries = ["UNKNOWN", "CHINA", "RUSSIA", "IRAN"]
+        self.critical_vendors = ["Microsoft", "Red Hat", "Canonical", "Oracle"]
+    
+    def transform_and_enhance_data(self):
+        """
+        Main transformation function that processes all documents.
+        
+        Returns:
+            bool: True if transformation successful, False otherwise
+        """
+        try:
+            logger.info("Starting comprehensive data transformation and risk assessment")
+            
+            # Create enhanced index mapping
+            mapping = {
+                "mappings": {
+                    "properties": {
+                        "hostname": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+                        "country": {"type": "keyword"},
+                        "os_name": {"type": "keyword"},
+                        "os_version": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+                        "internet_facing": {"type": "boolean"},
+                        "eol_eos_risk": {"type": "keyword"},
+                        "risk_category": {"type": "keyword"},
+                        "overall_risk_score": {"type": "integer"},
+                        "transformed_at": {"type": "date"}
+                    }
+                }
+            }
+            
+            # Create target index
+            if self.es.indices.exists(index=self.target_index):
+                self.es.indices.delete(index=self.target_index)
+                
+            self.es.indices.create(index=self.target_index, body=mapping)
+            logger.info(f"Created enhanced index '{self.target_index}'")
+            
+            # Use update_by_query for efficient transformation
+            script = """
+            // Calculate EOL/EOS Risk
+            if (ctx._source.os_name != null && ctx._source.os_version != null) {
+                String fullOsName = ctx._source.os_name + " " + ctx._source.os_version;
+                if (fullOsName.toLowerCase().contains("windows server 2012") ||
+                    fullOsName.toLowerCase().contains("ubuntu 18.04") ||
+                    fullOsName.toLowerCase().contains("centos 7")) {
+                    ctx._source.eol_eos_risk = "CRITICAL";
+                } else if (fullOsName.toLowerCase().contains("windows 10")) {
+                    ctx._source.eol_eos_risk = "HIGH";
+                } else {
+                    ctx._source.eol_eos_risk = "LOW";
+                }
+            } else {
+                ctx._source.eol_eos_risk = "UNKNOWN";
+            }
+            
+            // Calculate Geographic Risk
+            if (ctx._source.country == null || ctx._source.country.equals("UNKNOWN")) {
+                ctx._source.geographic_risk = "CRITICAL";
+            } else {
+                ctx._source.geographic_risk = "LOW";
+            }
+            
+            // Calculate Business Criticality
+            int criticalityScore = 0;
+            if (ctx._source.internet_facing != null && ctx._source.internet_facing) {
+                criticalityScore += 3;
+            }
+            if (ctx._source.cpu_cores != null && ctx._source.cpu_cores >= 8) {
+                criticalityScore += 2;
+            }
+            if (ctx._source.memory_gb != null && ctx._source.memory_gb >= 32) {
+                criticalityScore += 2;
+            }
+            
+            if (criticalityScore >= 5) {
+                ctx._source.business_criticality = "CRITICAL";
+            } else if (criticalityScore >= 3) {
+                ctx._source.business_criticality = "HIGH";
+            } else if (criticalityScore >= 1) {
+                ctx._source.business_criticality = "MEDIUM";
+            } else {
+                ctx._source.business_criticality = "LOW";
+            }
+            
+            // Calculate Overall Risk Score
+            Map riskWeights = ["CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 2];
+            int totalScore = riskWeights.get(ctx._source.eol_eos_risk) * 3 + 
+                           riskWeights.get(ctx._source.geographic_risk) * 1 + 
+                           riskWeights.get(ctx._source.business_criticality) * 2;
+                           
+            ctx._source.overall_risk_score = (int)((totalScore / 24.0) * 100);
+            
+            // Set Risk Category
+            if (ctx._source.overall_risk_score >= 75) {
+                ctx._source.risk_category = "CRITICAL";
+            } else if (ctx._source.overall_risk_score >= 60) {
+                ctx._source.risk_category = "HIGH";
+            } else if (ctx._source.overall_risk_score >= 40) {
+                ctx._source.risk_category = "MEDIUM";
+            } else {
+                ctx._source.risk_category = "LOW";
+            }
+            
+            // Add timestamp
+            ctx._source.transformed_at = new Date().getTime();
+            
+            // Filter out Unknown hostnames during processing
+            if (ctx._source.hostname != null && ctx._source.hostname.toLowerCase().equals("unknown")) {
+                ctx.op = "noop";
+            }
+            """
+            
+            # Execute the transformation using reindex
+            reindex_body = {
+                "source": {
+                    "index": self.source_index,
+                    "query": {
+                        "bool": {
+                            "must_not": {
+                                "term": {
+                                    "hostname.keyword": "Unknown"
+                                }
+                            }
+                        }
+                    }
+                },
+                "dest": {
+                    "index": self.target_index
+                },
+                "script": {
+                    "source": script,
+                    "lang": "painless"
+                }
+            }
+            
+            logger.info("Executing data transformation with Painless script...")
+            result = self.es.reindex(body=reindex_body, wait_for_completion=True)
+            
+            if result.get('took'):
+                logger.info(f"Transformation completed in {result['took']}ms")
+                logger.info(f"Created: {result.get('created', 0)} enhanced documents")
+                
+                # Refresh the index
+                self.es.indices.refresh(index=self.target_index)
+                
+                return result.get('created', 0) > 0
+            else:
+                logger.error("Transformation failed - no result returned")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Data transformation failed: {e}")
+            return False
 
-print("\n🎉 Data transformation and enrichment completed successfully!")
+
+def main():
+    """
+    Main execution function for IT asset transformation pipeline.
+    """
+    # Configuration
+    CLOUD_ID = "MyDeployment:YXNpYS1zb3V0aDEuZ2NwLmVsYXN0aWMtY2xvdWQuY29tJGYxOGQyMGE0OTlhZTQ4YzNhNDFjN2ZhNmZkZGNhM2ZhJDBlMGRhMGZmMjQyNDQ0OTNhYWFkOTJkNzg3YzFjZGRm"
+    API_KEY = "VkpIVl9wTUIxTEk1SGx6YVZkRHU6UFFTa29KbzVTOGVlZmpGZG10WmttQQ=="
+    
+    logger.info("Starting IT Asset Enhancement & Risk Assessment Pipeline")
+    
+    try:
+        # Initialize transformer
+        transformer = ITAssetTransformer(CLOUD_ID, API_KEY)
+        
+        # Transform and enhance data
+        if transformer.transform_and_enhance_data():
+            logger.info("✅ IT Asset transformation pipeline completed successfully")
+            return True
+        else:
+            logger.error("Data transformation failed")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Pipeline execution failed: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    success = main()
+    if success:
+        print("\n🎉 IT Asset transformation completed successfully!")
+        print("📊 Enhanced data with risk assessment is ready")
+        print("🎯 Executive dashboards can now be created in Kibana")
+        print("🚀 Access the 'it_assets_enhanced' index for advanced analytics")
+    else:
+        print("\n❌ IT Asset transformation failed")
+        print("📋 Check the logs for detailed error information")

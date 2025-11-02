@@ -1,19 +1,19 @@
 from elasticsearch import Elasticsearch, helpers
 import pandas as pd
 import os
-import uuid
 from datetime import datetime
+import json
 
+# Configuration
 ES_ENDPOINT = "https://my-elasticsearch-project-e74838.es.asia-south1.gcp.elastic.cloud:443"
 ES_API_KEY = "NXFiZUxwb0JOOUVTMksyeElqa0U6S051T2V2NnFJSlBaNW5ZOFZWaU5odw=="
 CSV_FILE = "C:/Users/ArjunReddyTadi/Desktop/mylearning/it_asset_inventory_cleaned.csv"
-TARGET_INDEX = "miniproject_index"
-
+TARGET_INDEX = "it_assets_index"
 # === CONNECT TO ELASTIC ===
 es = Elasticsearch(
     ES_ENDPOINT,
     api_key=ES_API_KEY,
-    verify_certs=True
+    verify_certs=False  # Temporary fix for SSL issues
 )
 
 # === CHECK CONNECTION ===
@@ -31,33 +31,70 @@ if not os.path.exists(CSV_FILE):
 df = pd.read_csv(CSV_FILE)
 print(f"📄 Loaded {len(df)} records from {CSV_FILE}")
 
-# === DATA CLEANING ===
-print("🧹 Cleaning data...")
+# === DATA VALIDATION AND CLEANING ===
+print("🧹 Validating and cleaning data...")
 
-# Remove empty/unnamed columns
-df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
-print(f"✂️ Removed unnamed columns, now have {len(df.columns)} columns")
-
-# Remove rows with null hostnames (if hostname exists)
+# Remove rows with empty hostnames
 initial_count = len(df)
-if 'hostname' in df.columns:
-    df = df.dropna(subset=['hostname'])
-    cleaned_count = len(df)
-    if initial_count != cleaned_count:
-        print(f"🗑️ Removed {initial_count - cleaned_count} records with null hostnames")
+df = df.dropna(subset=['hostname'])
+df = df[df['hostname'].str.strip() != '']
 
-print(f"✅ Data cleaned: {len(df)} records ready for indexing")
-print(f"📊 Columns: {list(df.columns)}")
+# Remove unnamed columns if they exist
+df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
 
-# === PREPARE BULK DATA WITH DETAILED ERROR HANDLING ===
+# Handle duplicate hostnames by adding suffix
+duplicates = df['hostname'].duplicated(keep=False)
+if duplicates.any():
+    print(f"⚠️ Found {duplicates.sum()} duplicate hostnames, adding unique suffixes...")
+    for idx in df[duplicates].index:
+        df.loc[idx, 'hostname'] = f"{df.loc[idx, 'hostname']}_dup_{idx}"
+
+cleaned_count = len(df)
+print(f"✅ Data cleaned: {initial_count} → {cleaned_count} records")
+
+# === CREATE INDEX WITH MAPPING ===
+index_mapping = {
+    "mappings": {
+        "properties": {
+            "hostname": {"type": "keyword"},
+            "country": {"type": "keyword"},
+            "operating_system_name": {"type": "keyword"},
+            "operating_system_provider": {"type": "keyword"},
+            "operating_system_installation_date": {
+                "type": "date",
+                "format": "yyyy-MM-dd||strict_date_optional_time||epoch_millis"
+            },
+            "operating_system_lifecycle_status": {"type": "keyword"},
+            "os_is_virtual": {"type": "keyword"},
+            "is_internet_facing": {"type": "keyword"},
+            "image_purpose": {"type": "keyword"},
+            "os_system_id": {"type": "keyword"},
+            "performance_score": {"type": "float"},
+            "indexed_at": {"type": "date"}
+        }
+    }
+}
+
+# Delete and recreate index for clean start
+try:
+    if es.indices.exists(index=TARGET_INDEX):
+        es.indices.delete(index=TARGET_INDEX)
+        print(f"🗑️ Deleted existing index '{TARGET_INDEX}'")
+    
+    es.indices.create(index=TARGET_INDEX, body=index_mapping)
+    print(f"✅ Created index '{TARGET_INDEX}' with proper mapping")
+except Exception as e:
+    print(f"⚠️ Index management error: {e}")
+
+# === PREPARE BULK DATA ===
 current_time = datetime.now().isoformat()
 actions = []
 
 for idx, row in df.iterrows():
-    # Convert row to dict and handle NaN values
+    # Convert to dict and handle NaN values
     doc = row.to_dict()
     
-    # Replace NaN values with None (null in JSON)
+    # Replace NaN with None
     for key, value in doc.items():
         if pd.isna(value):
             doc[key] = None
@@ -66,64 +103,35 @@ for idx, row in df.iterrows():
     doc['indexed_at'] = current_time
     doc['record_id'] = idx
     
-    # Use hostname as ID if available, otherwise use row index
-    doc_id = str(doc.get('hostname', f"record_{idx}"))
-    
     action = {
         "_index": TARGET_INDEX,
-        "_id": doc_id,
+        "_id": doc['hostname'],
         "_source": doc
     }
     actions.append(action)
 
-print(f"📦 Prepared {len(actions)} documents for bulk upload")
-
 # === BULK UPLOAD WITH DETAILED ERROR HANDLING ===
 try:
-    # Use bulk with error collection
     success_count, failed_items = helpers.bulk(
         es, 
-        actions, 
-        stats_only=False,
-        chunk_size=50,
-        request_timeout=120
+        actions,
+        chunk_size=100,
+        request_timeout=60
     )
     
     print(f"✅ Successfully uploaded {success_count} documents to index '{TARGET_INDEX}'")
     
-except helpers.BulkIndexError as e:
-    print(f"❌ Bulk index error occurred:")
-    print(f"   Successfully indexed: {len(actions) - len(e.errors)} documents")
-    print(f"   Failed to index: {len(e.errors)} documents")
-    
-    # Show detailed errors
-    print("\n🔍 First 5 errors for debugging:")
-    for i, error in enumerate(e.errors[:5]):
-        error_detail = error.get('index', error.get('create', {}))
-        error_info = error_detail.get('error', {})
-        doc_id = error_detail.get('_id', 'unknown')
-        
-        print(f"   Error {i+1} (Doc ID: {doc_id}):")
-        print(f"     Type: {error_info.get('type', 'unknown')}")
-        print(f"     Reason: {error_info.get('reason', 'unknown')}")
-        if 'caused_by' in error_info:
-            print(f"     Caused by: {error_info['caused_by'].get('reason', 'unknown')}")
-        print()
-    
-    if len(e.errors) > 5:
-        print(f"   ... and {len(e.errors) - 5} more errors")
-
-except Exception as e:
-    print(f"❌ Unexpected error during bulk upload: {e}")
-    print(f"   Error type: {type(e).__name__}")
-
-# === VERIFY INDEX ===
-try:
+    # Verify indexing
     import time
     time.sleep(2)  # Wait for indexing to complete
-    
     doc_count = es.count(index=TARGET_INDEX)['count']
-    print(f"\n🔍 Verification: Index '{TARGET_INDEX}' contains {doc_count} documents")
+    print(f"🔍 Verification: Index contains {doc_count} documents")
+    
+except helpers.BulkIndexError as e:
+    print(f"❌ Bulk indexing errors occurred:")
+    for error in e.errors[:5]:  # Show first 5 errors
+        print(f"   - {error}")
+    print(f"   Total errors: {len(e.errors)}")
     
 except Exception as e:
-    print(f"⚠️ Could not verify index: {e}") 
+    print(f"❌ Bulk upload failed: {e}") 

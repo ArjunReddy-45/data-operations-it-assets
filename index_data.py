@@ -409,9 +409,9 @@ def main():
     Main execution function for IT asset indexing pipeline.
     """
     # Configuration - Replace with your actual credentials
-    CLOUD_ID = "MyDeployment:YXNpYS1zb3V0aDEuZ2NwLmVsYXN0aWMtY2xvdWQuY29tJGYxOGQyMGE0OTlhZTQ4YzNhNDFjN2ZhNmZkZGNhM2ZhJDBlMGRhMGZmMjQyNDQ0OTNhYWFkOTJkNzg3YzFjZGRm"
-    API_KEY = "VkpIVl9wTUIxTEk1SGx6YVZkRHU6UFFTa29KbzVTOGVlZmpGZG10WmttQQ=="
-    CSV_FILE = "it_asset_inventory_cleaned.csv"
+    CLOUD_ID = "MyDeployment:"
+    API_KEY = "V"
+    CSV_FILE = "it_asset_inventory_cleaned.csv
     
     logger.info("Starting IT Asset Inventory Indexing Pipeline")
     logger.info(f"Target CSV file: {CSV_FILE}")
